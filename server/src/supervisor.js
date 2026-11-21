@@ -59,6 +59,10 @@ http.createServer((req, res) => {
   up.on('error', () => { if (!res.headersSent) json(res, 503, { error: 'Engine is down or still starting', engine_down: true }); else res.destroy(); });
   res.on('close', () => { if (!res.writableEnded) up.destroy(); });
   req.pipe(up);
+}).on('error', (e) => {
+  if (e.code === 'EADDRINUSE') console.error(`[supervisor] Port ${PORT} is already in use. Is another \`pnpm dev\` running? Stop it and retry.`);
+  else console.error('[supervisor]', e.message);
+  process.exit(1);
 }).listen(PORT, '127.0.0.1', () => {
   console.log(`[supervisor] http://127.0.0.1:${PORT} -> engine :${ENGINE_PORT}`);
   startEngine();

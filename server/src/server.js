@@ -84,6 +84,11 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') console.error(`[engine] Port ${PORT} is already in use (a leftover engine process?). Stop it and retry.`);
+  else console.error('[engine]', e.message);
+  process.exit(1);
+});
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[engine] pid ${process.pid} listening on http://127.0.0.1:${PORT} db=${DB_PATH}`);
   engine.start();
