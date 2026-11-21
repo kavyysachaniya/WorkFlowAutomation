@@ -10,8 +10,10 @@ server/   Node 22, zero dependencies (node:sqlite, node:http, SSE)
   src/parsers.js       parser interface (swap in an LLM parser via PARSER=<id>)
   src/server.js        engine process: HTTP API + SSE + scheduler
   src/supervisor.js    public port :8787, spawns/kills the engine, proxies /api
+  test/parser.test.js        parser unit tests
   test/crash.test.js         200 runs, 3× SIGKILL + restart
   test/multi-engine.test.js  2 engines on one DB, 200 runs, then takeover after a kill
+  test/bench.js              throughput benchmark (pnpm --filter server bench)
 web/      React + Vite + Tailwind v4 + lucide-react
 scripts/dev.mjs  one-command dev launcher (no extra deps)
 ```
@@ -27,7 +29,8 @@ pnpm install          # only web/ has dependencies; the server has none
 pnpm dev              # supervisor :8787 (+ engine :8788) and Vite :5173
 # open http://localhost:5173
 
-pnpm test             # crash test + multi-engine test (about 10s)
+pnpm test             # parser unit tests + crash test + multi-engine test (about 10s)
+pnpm --filter server bench   # throughput benchmark (optional)
 pnpm build            # production build of the web UI
 ```
 
@@ -71,7 +74,16 @@ Useful env vars: `DAY_MS` (demo speed, default 3000 = 1 simulated day is 3s), `L
 
 ### How it was tested (all of these were run; results below are from this machine)
 
-Windows 11, Node 22.22.3. `pnpm test` runs both suites against real engine processes on temp databases.
+Windows 11, Node 22.22.3. `pnpm test` runs the parser unit tests, then both engine suites against real engine processes on temp databases.
+
+**`parser.test.js`** (9 tests) covers:
+- the problem statement's own sentence → `branch(total > 500) → wait 1 day → message`;
+- `if` scoping per sentence, and quoted bodies that contain commas and periods;
+- trigger conditions vs branches, every operator, and `$1,200` → `1200`;
+- wait units, channels, known and explicit trigger events;
+- that unrecognised input returns errors rather than guesses.
+
+Every successful parse must also pass the engine's `validateWorkflow`.
 
 **`crash.test.js`.** Creates an 8-step workflow (task, email, wait, task, branch `plan = pro`, slack for pro only, wait, sms) and fires 200 events, half pro and half free, each with an `event_id`. Re-firing one must not create a run. It then **SIGKILLs the engine 3 times** at different points and restarts it each time. Every run must complete, with the exact expected delivery steps (pro 1, 5, 7; free 1, 7), each delivered **once**. The exact expected `step_log`, released leases, and total deliveries = 500 are also checked.
 
@@ -100,6 +112,18 @@ The full suite passed in 4 of 4 consecutive runs.
 - expanding run timelines (including branch-skipped steps), run filters, firing from a workflow card, changing speed, archiving, and Build manually;
 - at **390px** width: no horizontal overflow, header controls on screen, timeline expands;
 - no unexpected console errors or HTTP errors.
+
+### Throughput (measured, `pnpm bench`)
+
+This was measured on one engine process on a laptop (Windows 11, Node 22.22.3). The workflow has 4 steps (task, email, branch, slack), and events were fired over HTTP while the engine was working. Every benchmark run verified 0 duplicate deliveries.
+
+| Config | Runs | End-to-end | Throughput | Bottleneck |
+|---|---|---|---|---|
+| `MAX_CONCURRENCY=64` (default) | 2,000 | 8.5s | 236 runs/s · 827 steps/s | scheduler: 64 claims per 250ms tick (≈256 runs/s cap) |
+| `MAX_CONCURRENCY=256` | 5,000 | 9.3s | 538 runs/s · 1,884 steps/s | one process doing HTTP ingest + every SQLite write |
+| `MAX_CONCURRENCY=1024` | 5,000 | 10.6s | 472 runs/s · 1,654 steps/s | same; more concurrency doesn't help |
+
+Each step is its own durable transaction, so about 1,900 transactions/s is roughly the ceiling of a single SQLite writer here. That's the reason the design note below moves state to partitioned Postgres or a queue for 50k concurrent workflows. Waiting runs cost nothing while they wait (just a row with `wake_at`), so the number of *concurrent* workflows is limited by storage, not by this rate.
 
 ## Design note: scaling to 50,000 concurrent workflows
 
