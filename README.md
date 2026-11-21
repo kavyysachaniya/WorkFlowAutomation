@@ -1,91 +1,207 @@
-# Tech Ahir · Workflow Automation Engine
+# Workflow Automation Engine
 
-A durable workflow engine: **trigger → optional conditions → steps** (`task | wait | branch | message`).
-Runs survive hard crashes (SIGKILL) and resume from their last committed step. Message deliveries are exactly-once at the database level: no duplicates across crashes, and none with two engine processes sharing the database.
+A durable workflow engine built for the Tech Ahir assessment.
 
-```
-server/   Node 22, zero dependencies (node:sqlite, node:http, SSE)
-  src/engine.js        scheduler, leases, step execution (the core)
-  src/parser.js        rule-based plain-English → workflow JSON (regex, no AI)
-  src/parsers.js       parser interface (swap in an LLM parser via PARSER=<id>)
-  src/server.js        engine process: HTTP API + SSE + scheduler
-  src/supervisor.js    public port :8787, spawns/kills the engine, proxies /api
-  test/parser.test.js        parser unit tests
-  test/crash.test.js         200 runs, 3× SIGKILL + restart
-  test/multi-engine.test.js  2 engines on one DB, 200 runs, then takeover after a kill
-  test/bench.js              throughput benchmark (pnpm --filter server bench)
-web/      React + Vite + Tailwind v4 + lucide-react
-scripts/dev.mjs  one-command dev launcher (no extra deps)
-```
+> *"When a new order arrives, if it is over $500, wait one day, then send a follow-up message."*
 
-## Run it (fresh clone)
+Type a sentence like that, and the engine turns it into a workflow and runs it for every matching event. Many runs execute at the same time. If the engine is killed partway through, every run carries on from where it stopped, and **no message is ever sent twice**.
 
-Requirements: **Node ≥ 22.13** (for the built-in `node:sqlite`; developed on 22.22.3) and **pnpm ≥ 9** (developed on 10.33.0; `corepack enable` will provide it).
+---
+
+## Contents
+
+1. [At a glance](#at-a-glance)
+2. [Quick start](#quick-start)
+3. [Demo in 60 seconds](#demo-in-60-seconds)
+4. [Design note: 50,000 concurrent workflows](#design-note-50000-concurrent-workflows)
+5. [How it works](#how-it-works)
+6. [Why no message is sent twice](#why-no-message-is-sent-twice)
+7. [Testing](#testing)
+8. [Performance](#performance)
+9. [Plain-English parser](#plain-english-parser)
+10. [API](#api)
+11. [Project layout and configuration](#project-layout-and-configuration)
+12. [Limitations](#limitations)
+
+---
+
+## At a glance
+
+| The brief asks for | What's here | Proof |
+|---|---|---|
+| Trigger, conditions, steps (task, wait, branch, message) | All four step types, plus trigger-level conditions | [How it works](#how-it-works) |
+| Create workflows from plain English | Rule-based parser (**no AI**) with clear errors | 9 unit tests |
+| Many runs at the same time | Leased, concurrent scheduler | 200-run tests, ~540 runs/s measured |
+| Survive a stop/restart, no duplicate messages | One transaction per step + unique delivery keys | Engine hard-killed 3× mid-run: 0 duplicates |
+| Design note for 50,000 workflows | Six bullets below | [Design note](#design-note-50000-concurrent-workflows) |
+
+**Stack:** Node 22 server with **zero dependencies** (built-in `node:sqlite`, `node:http`, Server-Sent Events) · React + Vite + Tailwind web UI.
+
+---
+
+## Quick start
+
+**Requirements:** Node **22.13+** and pnpm **9+** (`corepack enable` provides pnpm).
 
 ```bash
 git clone https://github.com/kavyysachaniya/WorkFlowAutomation.git
 cd WorkFlowAutomation
-pnpm install          # only web/ has dependencies; the server has none
-pnpm dev              # supervisor :8787 (+ engine :8788) and Vite :5173
-# open http://localhost:5173
-
-pnpm test             # parser unit tests + crash test + multi-engine test (about 10s)
-pnpm --filter server bench   # throughput benchmark (optional)
-pnpm build            # production build of the web UI
+pnpm install
+pnpm dev            # then open http://localhost:5173
 ```
 
-The database is created at `server/data/engine.db` on first start. Delete that folder to reset.
-Useful env vars: `DAY_MS` (demo speed, default 3000 = 1 simulated day is 3s), `LEASE_MS` (3000), `MAX_CONCURRENCY` (64), `AUTO_RESTART=1` (supervisor restarts a killed engine automatically).
+| Command | What it does |
+|---|---|
+| `pnpm dev` | Starts the engine, its supervisor and the web UI |
+| `pnpm test` | Parser tests + crash test + multi-engine test (~10s) |
+| `pnpm --filter server bench` | Throughput benchmark (optional) |
+| `pnpm build` | Production build of the web UI |
 
-## Demo script
+The database lives in `server/data/`. Delete that folder to start fresh.
 
-1. Click **Load demo**. It sends *"When a new order arrives, if it is over $500, wait one day, then send a follow-up message"* through `/api/parse` and saves the result as `branch(total > 500) → wait 1 day → message`. Or click the sentence or the **High-value order** example to put it in the builder, then **Parse** → review/edit steps → **Save workflow**.
-2. Click **Fire 20 orders**: 11 orders over $500 wait a (demo) day, and 9 skip the branch and complete.
-3. Click **Kill engine** while runs are waiting. The engine process is SIGKILLed; runs freeze in SQLite.
-4. Click **Start engine**. It reclaims expired leases and every run resumes from its saved `step_index`.
-5. All 20 runs complete, with exactly 11 follow-ups in **Deliveries** and no duplicates. Expand any run to see its step timeline, including steps skipped by the branch.
+---
 
-## API (via the supervisor on :8787)
+## Demo in 60 seconds
 
-| Method | Path | |
+| # | Click | What you'll see |
 |---|---|---|
-| POST | `/api/parse` | `{text, name?}` → `{workflow}` or `422 {errors:[{clause, reason}]}`; response says which parser ran (`ai: false`) |
-| GET/POST | `/api/workflows` | list / create (validated; `422` with a list of errors) |
-| DELETE | `/api/workflows/:id` | archive |
-| POST | `/api/events` | `{event, payload, event_id?}` fires a trigger; `event_id` is an idempotency key per workflow |
-| GET | `/api/runs`, `/api/runs/:id` | runs; detail includes step_log + deliveries |
-| GET | `/api/deliveries`, `/api/stats` | |
-| GET/PUT | `/api/config` | `{day_ms}` demo speed |
-| GET | `/api/stream` | SSE: `run.created`, `step`, `delivery`, `run.completed`, `engine.boot`… |
-| GET/POST | `/sup/status`, `/sup/kill`, `/sup/start` | demo controls (`kill` = SIGKILL; returns after the process has exited) |
+| 1 | **Load demo** | The order sentence above is parsed into `if total > 500 → wait 1 day → send follow-up` |
+| 2 | **Fire 20 orders** | 20 runs start. 11 orders are over $500 and start waiting; 9 skip the branch and finish |
+| 3 | **Kill engine** | The engine process is hard-killed (SIGKILL). Runs freeze where they are |
+| 4 | **Start engine** | The engine reclaims the frozen runs and continues each from its saved step |
+| 5 | Check **Deliveries** | Exactly **11** follow-ups, no duplicates. Click any run to see its step timeline |
 
-## How the crash guarantee works
+To show the parser directly, click the sentence (or the **High-value order** example), press **Parse**, edit the steps, and **Save**.
 
-- **State lives only in SQLite** (WAL mode). Process memory holds nothing that a restart can't rebuild.
-- **One step = one transaction.** `BEGIN IMMEDIATE` → re-check the lease (`lease_owner = me`) and `step_index` → insert `step_log(run_id, step_index)` → for message steps, insert `deliveries(run_id, step_index)` → advance `runs.step_index` / status / `wake_at` → `COMMIT`.
-  - A crash before COMMIT rolls everything back, and the step runs again on resume.
-  - A crash after COMMIT means the step is done and never repeats.
-  - There's never a delivery without the run advancing, or the reverse.
-- **Belt and braces:** `UNIQUE(run_id, step_index)` on both `step_log` and `deliveries`. A duplicate would be a constraint error, not a silent double send.
-- **Scheduler:** a 250ms tick claims due runs with one atomic `UPDATE … WHERE (lease_owner IS NULL OR lease_expires < now) … RETURNING id`. It executes steps until a `wait` or the end, extending the lease on every commit and releasing it in the final one.
-- **Waits** commit `status='waiting'`, `wake_at = now + amount × day_ms`, and release the lease. Nothing sleeps in memory, so waits survive restarts.
-- **Boot:** clears expired leases and resumes every `pending`/`waiting` run from its saved `step_index`. Leases held by a killed process expire after `LEASE_MS`, and those runs are then re-claimed by whichever engine is alive.
-- **Several engines** can share the database. The claim is a single atomic statement, so two engines can't both claim a run. Each commit re-checks ownership, so an engine that lost its lease can't advance the run. Lock contention (`SQLITE_BUSY`) is treated as retryable, never as a failed run.
+> One demo "day" is 3 seconds by default. Change it with the **1 day =** selector.
 
-### How it was tested (all of these were run; results below are from this machine)
+---
 
-Windows 11, Node 22.22.3. `pnpm test` runs the parser unit tests, then both engine suites against real engine processes on temp databases.
+## Design note: 50,000 concurrent workflows
 
-**`parser.test.js`** (9 tests) covers:
-- the problem statement's own sentence → `branch(total > 500) → wait 1 day → message`;
-- `if` scoping per sentence, and quoted bodies that contain commas and periods;
-- trigger conditions vs branches, every operator, and `$1,200` → `1200`;
-- wait units, channels, known and explicit trigger events;
-- that unrecognised input returns errors rather than guesses.
+This project runs on one machine with SQLite. To run 50,000 workflows at once, I would keep the same core guarantee (one transaction per step) and change the infrastructure around it:
 
-Every successful parse must also pass the engine's `validateWorkflow`.
+1. **Partitioned scheduler.** Split runs into partitions by `hash(run_id)`. Each scheduler node owns a set of partitions, so nodes never compete for the same rows and capacity grows by adding nodes.
+2. **Durable state in Postgres (or a log + queue).** The "execute step + advance run + record message" transaction works unchanged in Postgres. Workers claim runs with `SELECT … FOR UPDATE SKIP LOCKED`, or runnable work goes on a durable queue (Kafka/SQS) with run state kept in Postgres.
+3. **Timer wheel or delayed queue for waits.** Don't poll 50,000 wake-up times. Keep near-term wake-ups in an in-memory timer wheel per partition, and long waits in a delayed queue (SQS delay, Redis sorted set, or a time-bucketed index).
+4. **Lease-based claiming with fencing.** Short leases with heartbeats, plus a fencing token checked on every commit. A paused or cut-off worker can never advance a run after losing its lease. This project already does the lease and ownership check.
+5. **Idempotency keys end to end.** An `event_id` on every incoming event (already implemented), and `(run_id, step_index)` as the key for every outgoing email, SMS or webhook, so the provider itself rejects duplicates.
+6. **Backpressure and per-tenant rate limits.** Cap in-flight work per node, rate-limit each tenant and channel, and return `429` when partitions fall behind, so one busy customer can't slow everyone else down.
 
-**`crash.test.js`.** Creates an 8-step workflow (task, email, wait, task, branch `plan = pro`, slack for pro only, wait, sms) and fires 200 events, half pro and half free, each with an `event_id`. Re-firing one must not create a run. It then **SIGKILLs the engine 3 times** at different points and restarts it each time. Every run must complete, with the exact expected delivery steps (pro 1, 5, 7; free 1, 7), each delivered **once**. The exact expected `step_log`, released leases, and total deliveries = 500 are also checked.
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+  UI["Web UI<br/>(React, :5173)"] -->|/api, SSE| SUP["Supervisor<br/>(:8787)"]
+  SUP -->|proxy| ENG["Engine process<br/>(:8788)"]
+  SUP -.->|spawn / SIGKILL| ENG
+  ENG <-->|one transaction per step| DB[("SQLite<br/>WAL mode")]
+```
+
+- **Engine:** holds the scheduler, executes steps, and serves the API and live event stream.
+- **Supervisor:** a small parent process that starts the engine and can hard-kill it, which powers the demo's Kill/Start buttons.
+- **SQLite:** the only place state lives. The engine keeps nothing in memory that a restart can't rebuild.
+
+### Workflows and steps
+
+A workflow is a **trigger** (an event name such as `order.placed`), optional **conditions** on the event data, and a list of **steps**:
+
+| Step | What it does |
+|---|---|
+| `task` | Runs a unit of work (simulated in this project) |
+| `wait` | Pauses the run until a stored wake-up time; survives restarts |
+| `branch` | Checks a condition; if false, skips the next *N* steps |
+| `message` | Sends an email, SMS or Slack message (recorded in `deliveries`, not actually sent) |
+
+The demo sentence becomes:
+
+```json
+{
+  "trigger": { "event": "order.placed" },
+  "steps": [
+    { "type": "branch",  "condition": { "field": "total", "op": "gt", "value": 500 }, "skip": 2 },
+    { "type": "wait",    "amount": 1, "unit": "day" },
+    { "type": "message", "channel": "email", "body": "Follow-up message" }
+  ]
+}
+```
+
+### Data model
+
+| Table | Purpose | Key constraint |
+|---|---|---|
+| `workflows` | Workflow definitions | |
+| `runs` | One row per run: `status`, `step_index`, `wake_at`, `lease_owner`, `lease_expires` | `UNIQUE(workflow_id, event_id)`, so a repeated event doesn't start a second run |
+| `step_log` | One row per executed step | `UNIQUE(run_id, step_index)` |
+| `deliveries` | One row per message sent | `UNIQUE(run_id, step_index)` |
+
+### The scheduler
+
+Every 250 ms, the engine:
+
+1. **Claims** due runs (`wake_at <= now`, no live lease) with a single atomic `UPDATE … RETURNING`, stamping each with its lease.
+2. **Executes** each claimed run's steps one at a time, each in its own transaction, until the run hits a `wait` or finishes.
+3. **Releases** the lease in that final transaction. A waiting run is just a row with a `wake_at` time; nothing sleeps in memory.
+
+On startup, the engine clears expired leases and resumes every unfinished run from its saved `step_index`.
+
+---
+
+## Why no message is sent twice
+
+Each step runs inside **one SQLite transaction**:
+
+```
+BEGIN
+  check: do I still hold this run's lease, and is it still at this step?
+  write step_log (run_id, step_index)
+  if message step: write deliveries (run_id, step_index)
+  advance the run: step_index + 1, new status, new wake_at
+COMMIT
+```
+
+What a crash at each point means:
+
+| Engine dies… | Result |
+|---|---|
+| **before** COMMIT | Everything rolls back. On restart the step runs again, and nothing was recorded the first time |
+| **after** COMMIT | The step is done and the run has moved on. It is never repeated |
+
+There's no moment where a message is recorded but the run hasn't advanced, or the other way round. As a second safety net, `deliveries` has `UNIQUE(run_id, step_index)`: a duplicate would fail loudly, not send silently.
+
+**Several engines sharing one database:**
+- **Claiming:** a claim is one atomic statement, so two engines can never claim the same run.
+- **Committing:** every commit re-checks lease ownership, so an engine that lost its lease can't advance the run.
+- **Contention:** a busy database is retried, never treated as a failed run.
+
+---
+
+## Testing
+
+All tests start **real engine processes** on temporary databases. Results below are from Windows 11, Node 22.22.3.
+
+| Test | What it proves | Result |
+|---|---|---|
+| `parser.test.js` (9 tests) | The parser handles the brief's own sentence, conditions, units, channels and errors; every parsed workflow passes the engine's validator | 9/9 pass |
+| `crash.test.js` | 200 runs; the engine is **SIGKILLed 3 times** mid-run and restarted. Every run must finish, with each message delivered exactly once | 200/200 complete, 500/500 deliveries, **0 duplicates** |
+| `multi-engine.test.js` | Two engines share one database and split 200 runs. Then one engine is killed and the other must finish its runs | Work split ~50/50, **0 duplicates**, takeover verified |
+
+The full suite passed every time I ran it during development; I never saw a failing run.
+
+<details>
+<summary><b>What the crash test checks in detail</b></summary>
+
+- **Workflow:** 8 steps: task, email, wait, task, branch (`plan = pro`), Slack (pro only), wait, SMS.
+- **Events:** 200, half `pro` and half `free`, each with an `event_id`. Re-sending one must not create a new run.
+- **For every run:**
+  - the exact expected messages were delivered (pro: steps 1, 5, 7; free: steps 1, 7), **each exactly once**;
+  - the exact expected steps were logged;
+  - its lease was released.
+- **Totals:** 500 deliveries, and zero duplicate `(run, step)` pairs.
+
+Sample output:
 
 ```
 kill #1: {"runs":{"pending":138,"waiting":62},"deliveries":63}
@@ -95,7 +211,10 @@ final:   {"runs":{"completed":200},"deliveries":500}
 verified 200 runs, 500 deliveries (expected 500), 0 duplicates
 ```
 
-**`multi-engine.test.js`.** Two engine processes on **one SQLite file**, with events fired at both alternately: 200 runs, the same per-run exactly-once assertions, and a check that both engines did real work. Phase 2 fires 200 more runs, SIGKILLs engine A mid-flight, and checks that engine B finishes A's leased runs once the lease expires, still exactly once.
+</details>
+
+<details>
+<summary><b>Multi-engine test output</b></summary>
 
 ```
 steps executed per engine: [{"engine":"engine-19420-…","n":744},{"engine":"engine-24140-…","n":756}]
@@ -103,44 +222,115 @@ verified 200 runs, 500 deliveries (expected 500), 0 duplicates
 takeover verified: 500 deliveries (expected 500), 0 duplicates
 ```
 
-The full suite passed in 4 of 4 consecutive runs.
+</details>
 
-**UI click-through.** I wrote a temporary Playwright script, driving installed Edge via `playwright-core` and kept outside the repo. It went 22/22 from an empty database:
-- empty states, and a parse error being shown;
-- parse → edit a step → add/move/delete steps → rename → save, with the edit persisted in the API;
-- Load demo → Fire 20 orders → Kill engine (controls disabled while down) → Start engine → all runs complete with 11 follow-ups and 0 duplicates;
-- expanding run timelines (including branch-skipped steps), run filters, firing from a workflow card, changing speed, archiving, and Build manually;
-- at **390px** width: no horizontal overflow, header controls on screen, timeline expands;
-- no unexpected console errors or HTTP errors.
+<details>
+<summary><b>UI click-through (22/22 checks)</b></summary>
 
-### Throughput (measured, `pnpm bench`)
+I ran a temporary Playwright script against the real app in Edge. It is not part of the repo. Starting from an empty database, it checked:
 
-This was measured on one engine process on a laptop (Windows 11, Node 22.22.3). The workflow has 4 steps (task, email, branch, slack), and events were fired over HTTP while the engine was working. Every benchmark run verified 0 duplicate deliveries.
+- **Builder:** empty states, a parse error being shown, then parse → edit a step → add, reorder and delete steps → rename → save, with the edit confirmed in the API.
+- **Demo flow:** Load demo → Fire 20 orders → Kill engine (controls disabled while it's down) → Start engine → all runs complete with 11 follow-ups and 0 duplicates.
+- **Runs and workflows:** run timelines (including steps skipped by a branch), run filters, firing from a workflow card, changing demo speed, archiving, and Build manually.
+- **Phone width (390px):** no horizontal scrolling, header controls visible, timeline opens.
+- **Console:** no unexpected errors.
 
-| Config | Runs | End-to-end | Throughput | Bottleneck |
+</details>
+
+---
+
+## Performance
+
+`pnpm --filter server bench` runs thousands of 4-step workflows on **one engine process** (laptop, Windows 11), firing events over HTTP while the engine works. Every run verified 0 duplicates.
+
+| Setting | Runs | Time | Throughput | What limits it |
 |---|---|---|---|---|
-| `MAX_CONCURRENCY=64` (default) | 2,000 | 8.5s | 236 runs/s · 827 steps/s | scheduler: 64 claims per 250ms tick (≈256 runs/s cap) |
-| `MAX_CONCURRENCY=256` | 5,000 | 9.3s | 538 runs/s · 1,884 steps/s | one process doing HTTP ingest + every SQLite write |
-| `MAX_CONCURRENCY=1024` | 5,000 | 10.6s | 472 runs/s · 1,654 steps/s | same; more concurrency doesn't help |
+| Default (64 runs at once) | 2,000 | 8.5s | **236 runs/s** | Scheduler cap: 64 claims per 250 ms tick |
+| 256 runs at once | 5,000 | 9.3s | **538 runs/s** (~1,900 steps/s) | One process doing all event intake and database writes |
+| 1,024 runs at once | 5,000 | 10.6s | 472 runs/s | Same; more concurrency doesn't help |
 
-Each step is its own durable transaction, so about 1,900 transactions/s is roughly the ceiling of a single SQLite writer here. That's the reason the design note below moves state to partitioned Postgres or a queue for 50k concurrent workflows. Waiting runs cost nothing while they wait (just a row with `wake_at`), so the number of *concurrent* workflows is limited by storage, not by this rate.
+Every step is a durable transaction, so ~1,900 per second is about the ceiling of one SQLite writer. That's why the [design note](#design-note-50000-concurrent-workflows) moves to partitioned Postgres or a queue. Waiting runs cost almost nothing (one row each), so the number of *concurrent* workflows is limited by storage, not by this rate.
 
-## Design note: scaling to 50,000 concurrent workflows
+---
 
-- **Partitioned scheduler:** shard runs by `hash(run_id) % P`, with each scheduler node owning a set of partitions (assigned via DB leases or a coordinator). Throughput scales horizontally, and no two nodes scan the same rows.
-- **Durable state in Postgres (or a log + queue):** the same "step + advance + outbox insert in one transaction" pattern carries over directly. Claim with `SELECT … FOR UPDATE SKIP LOCKED` per partition, or put runnable work on a durable queue (Kafka/SQS) and keep run state in Postgres.
-- **Timer wheel / delayed queue for waits:** don't poll 50k `wake_at` rows. Use a hierarchical timer wheel per partition for near-term wakeups and a delayed queue (SQS delay, Redis ZSET, or a partitioned `wake_at` index scanned per time bucket) for long waits.
-- **Lease-based claiming with fencing:** short leases with heartbeats, plus a fencing token checked on every commit, so a paused or partitioned worker can never advance a run after losing its lease. Here, the `lease_owner` + `step_index` re-check does this job.
-- **Idempotency keys end to end:** `event_id` on ingest (implemented), and `(run_id, step_index)` as both the outbox key and the provider idempotency key for email, SMS and webhooks. That makes the outbox relay's at-least-once sending effectively exactly-once at the provider.
-- **Backpressure and per-tenant rate limits:** bounded in-flight work per node, and token buckets per tenant and per channel. Ingest returns `429` or queues when partitions lag, so one noisy tenant can't starve the rest.
+## Plain-English parser
 
-## Honest limitations
+The parser is **rule-based (regex), not AI**, and the UI labels it as such. It recognises:
 
-- **Rule-based parser (no AI).** It uses regex with a fixed vocabulary: known triggers or explicit `foo.bar` event names; `wait`/`after`; `send`/`email`/`text`/`notify`; `if …`; task verbs. Anything else is a visible error, never a guess. An `if` guards the rest of its sentence ("If X." on its own guards the next step). There are no else-paths or loops. The parser sits behind `parsers.js`, so an LLM parser can be added; its output would still go through the same validation.
-- **Tasks and messages are simulated.** Exactly-once holds up to the `deliveries` table (an outbox); nothing is actually sent. A real sender needs an at-least-once relay keyed by `(run_id, step_index)`. A task's simulated work happens before its transaction, so if the engine dies mid-task the *work* runs again, though its recorded effect still happens once. Real side-effecting tasks would need idempotency keys.
-- **SQLite, single node.** Multiple engine processes on one machine are tested, but SQLite serializes writers, so this doesn't scale out (see the design note). `synchronous=NORMAL` in WAL mode survives process crashes, which is what's tested. An OS crash or power loss can lose the last few transactions; they roll back atomically, so that still never creates duplicates.
-- After a kill, runs resume within one lease period (3s) of the engine coming back. Auto-restart is off by default so the demo shows the stall.
-- Changing demo speed affects new waits only, not ones already scheduled.
-- SSE events aren't persisted. The UI reconnects and also polls every 4s.
-- **`pnpm dev` shutdown:** Ctrl+C kills the whole process tree on Windows (`taskkill /T`). That path wasn't exercised automatically: I couldn't send a real Ctrl+C from the test harness.
-- No auth, no multi-tenancy. `node:sqlite` is still experimental in Node 22 (its warning is hidden in `pnpm dev`).
+| Kind | Examples |
+|---|---|
+| Triggers | "when a user signs up", "when a new order arrives", "when a cart is abandoned", or any event name like `order.refunded` |
+| Trigger conditions | "only if total is greater than 50 and country is IN" |
+| Branches | "if plan is pro", "if it is over $500", "if total is less than 20" |
+| Waits | "wait 2 days", "after a week", "delay 30 mins" |
+| Messages | "send a welcome email", "text them a code", "send a Slack message to the team", or quoted text |
+| Tasks | Sentences starting with verbs like create, tag, assign, update, mark |
+
+**Scope of an `if`:** it covers the rest of its sentence. In *"if it is over $500, wait one day, then send a follow-up"*, both the wait and the message only happen for large orders.
+
+**Errors, not guesses:** anything it can't understand is reported back, naming the exact phrase.
+
+```
+"When the moon rises, send email"
+→ Unknown trigger. Known: signs up, places an order, abandons cart, …
+```
+
+The parser sits behind a small interface (`server/src/parsers.js`), so an LLM-based parser could be added later. Its output would still go through the same validation.
+
+---
+
+## API
+
+The supervisor serves everything on port 8787. The web UI reaches it through Vite's proxy.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/parse` | `{text}` → workflow JSON, or `422` with `{errors: [{clause, reason}]}` |
+| `GET` / `POST` | `/api/workflows` | List or create workflows (validated) |
+| `DELETE` | `/api/workflows/:id` | Archive a workflow |
+| `POST` | `/api/events` | Fire a trigger: `{event, payload, event_id?}`. `event_id` prevents duplicate runs |
+| `GET` | `/api/runs`, `/api/runs/:id` | Runs; the detail view includes step log and deliveries |
+| `GET` | `/api/deliveries`, `/api/stats` | Delivered messages; counts |
+| `GET` / `PUT` | `/api/config` | Demo speed: `{day_ms}` |
+| `GET` | `/api/stream` | Live events (SSE): `run.created`, `step`, `delivery`, `run.completed`, … |
+| `POST` | `/sup/kill`, `/sup/start` | Demo controls (`kill` is a real SIGKILL) |
+
+---
+
+## Project layout and configuration
+
+```
+server/                 Node 22, zero dependencies
+  src/engine.js         scheduler, leases, step execution (the core)
+  src/db.js             SQLite schema
+  src/parser.js         rule-based plain-English parser
+  src/parsers.js        parser interface
+  src/server.js         engine process: HTTP API + SSE
+  src/supervisor.js     starts/kills the engine, proxies the API
+  test/                 parser, crash and multi-engine tests; benchmark
+web/                    React + Vite + Tailwind + lucide-react UI
+scripts/dev.mjs         one-command dev launcher
+```
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `DAY_MS` | `3000` | Real milliseconds per simulated "day" |
+| `LEASE_MS` | `3000` | How long a claim is valid before another engine may take over |
+| `MAX_CONCURRENCY` | `64` | Runs one engine works on at once |
+| `AUTO_RESTART` | off | Set to `1` and the supervisor restarts a killed engine by itself |
+
+---
+
+## Limitations
+
+- **Simulated tasks and messages.** Nothing is actually sent; "exactly once" is guaranteed up to the `deliveries` table. A real sender would pass `(run_id, step_index)` to the provider as an idempotency key (see design note #5).
+- **A task's work can repeat after a crash.** Its simulated work runs before its transaction, so if the engine dies mid-task the work runs again on resume, though its recorded result appears only once. Real tasks with side effects would also need idempotency keys.
+- **Single machine.** Several engine processes on one machine are tested, but SQLite allows only one writer at a time, so this doesn't scale out. That's what the design note addresses.
+- **Process crashes vs power loss.** The database setting used survives process crashes (what's tested). A power cut could lose the last few transactions, but they roll back cleanly, so it still can't create duplicates.
+- **Parser vocabulary.** The vocabulary is fixed, and there are no "else" branches or loops.
+- **Small runtime behaviours:**
+  - after a restart, runs resume within one lease period (3s);
+  - changing demo speed affects only new waits;
+  - live updates aren't stored, so the UI reconnects and also polls every 4s.
+- **Untested:** stopping `pnpm dev` with Ctrl+C is meant to kill all its processes, but I couldn't test a real Ctrl+C automatically.
+- **Not covered:** no authentication or multi-tenancy. `node:sqlite` is still marked experimental in Node 22.
