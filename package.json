@@ -1,0 +1,16 @@
+{
+  "name": "tech-ahir-workflow-engine",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22.13",
+    "pnpm": ">=9"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "server": "pnpm --filter server start",
+    "web": "pnpm --filter web dev",
+    "build": "pnpm --filter web build",
+    "test": "pnpm --filter server test"
+  }
+}
